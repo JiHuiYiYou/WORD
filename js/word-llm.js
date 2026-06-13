@@ -225,3 +225,117 @@ WORD.LLM.testConnection = async function () {
     return { success: false, message: '连接失败：' + err.message };
   }
 };
+
+/**
+ * Extract English-Chinese word pairs from arbitrary text using LLM.
+ * Handles markdown tables, emoji-bullet lists, plain text, mixed sections, etc.
+ * Skips non-pair content (section headers, examples, study tips).
+ *
+ * @param {string} text - The messy input text
+ * @returns {Promise<{success: boolean, pairs?: Array<{english: string, chinese: string}>, message?: string}>}
+ */
+WORD.LLM.extractWordPairs = async function (text) {
+  if (!text || !text.trim()) {
+    return { success: false, message: '请先粘贴要提取的文本' };
+  }
+  if (!WORD.state.llm.enabled) {
+    return { success: false, message: '请先在「API 设置」中启用 LLM 并配置 API Key' };
+  }
+  if (!WORD.state.llm.apiKey) {
+    return { success: false, message: '请先在「API 设置」中填写 DeepSeek API Key' };
+  }
+
+  var systemPrompt =
+    '你是一个英语单词提取助手。用户会粘贴一段可能很杂乱、格式不统一的英文单词文本。\n' +
+    '你的任务是：从中提取出每一个「英文单词/短语 + 中文释义」的配对。\n\n' +
+    '需要遵守的规则：\n' +
+    '1. 输入可能是：Markdown 表格、emoji 列表（如 🧱 一、...）、带音标的行、纯文本行、混排短语辨析、章节标题等。\n' +
+    '2. 只提取真正的「单词/短语 ↔ 中文释义」配对。\n' +
+    '3. 章节标题（如「一、建筑与材料类」「📝 实用短语」「易混淆/近义词辨析」）、示例句、学习建议、方法说明、提问句等，都不要。\n' +
+    '4. 如果一行有音标（如 /ˈkɒŋkriːt/），只保留英文单词本身（去掉音标），中文释义也要去掉音标。\n' +
+    '5. 如果一行既有英文又有中文，中间用斜杠 / 隔开的，把斜杠左右两边分别作为英文和中文。\n' +
+    '6. 多词短语（如 "look forward to"、"seal up"、"fall apart"、"self-heal"）保留完整短语，不要拆。\n' +
+    '7. 英文只保留字母、空格、连字符、撇号（如 it is、self-heal 中的撇号）；中文保留完整释义。\n' +
+    '8. 去重：相同的英文只保留第一次出现的那条。\n' +
+    '9. 严格只返回 JSON 数组，不要任何解释文字，不要 markdown 代码块标记。\n\n' +
+    '返回格式示例：[{"english":"concrete","chinese":"混凝土"},{"english":"seal up","chinese":"封住，堵住"}]';
+
+  var userMessage = '以下是待提取的文本：\n\n' + text;
+
+  var fetchPromise = fetch(WORD.state.llm.apiBase + '/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + WORD.state.llm.apiKey
+    },
+    body: JSON.stringify({
+      model: WORD.state.llm.model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage }
+      ],
+      temperature: 0,
+      max_tokens: 4000
+    })
+  });
+
+  var timeoutPromise = new Promise(function (_, reject) {
+    setTimeout(function () { reject(new Error('LLM 提取超时（30 秒）')); }, 30000);
+  });
+
+  try {
+    var response = await Promise.race([fetchPromise, timeoutPromise]);
+    if (!response.ok) {
+      var errorText = '';
+      try { errorText = await response.text(); } catch (e) {}
+      return { success: false, message: 'API 错误 ' + response.status + '：' + errorText.substring(0, 200) };
+    }
+
+    var data = await response.json();
+    var content = data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content
+      : '';
+
+    // Try to extract JSON array from response
+    var jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      return { success: false, message: 'LLM 未返回有效 JSON，请重试。原始返回：' + content.substring(0, 200) };
+    }
+
+    var parsed = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(parsed)) {
+      return { success: false, message: 'LLM 返回格式错误，需要 JSON 数组' };
+    }
+
+    // Normalize & filter (accept any case-insensitive variant of english/chinese/en/ch)
+    var seen = {};
+    var pairs = [];
+    for (var i = 0; i < parsed.length; i++) {
+      var item = parsed[i];
+      if (!item || typeof item !== 'object') continue;
+      var en = '', ch = '';
+      for (var key in item) {
+        if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
+        var lk = key.toLowerCase();
+        if (!en && (lk === 'english' || lk === 'en' || lk === 'word')) {
+          en = (item[key] || '').toString().trim();
+        } else if (!ch && (lk === 'chinese' || lk === 'ch' || lk === 'meaning' || lk === 'translation')) {
+          ch = (item[key] || '').toString().trim();
+        }
+      }
+      if (!en || !ch) continue;
+      var dedupKey = en.toLowerCase();
+      if (seen[dedupKey]) continue;
+      seen[dedupKey] = true;
+      pairs.push({ english: en, chinese: ch });
+    }
+
+    if (!pairs.length) {
+      return { success: false, message: 'LLM 未能提取出任何单词对' };
+    }
+
+    return { success: true, pairs: pairs };
+  } catch (err) {
+    return { success: false, message: '提取失败：' + err.message };
+  }
+};

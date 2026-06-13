@@ -213,6 +213,214 @@ WORD.Reinforce._removeEntry = function (idx) {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// LLM word-pair extraction (sidebar)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+WORD.Reinforce._llmSectionCollapsed = false;
+
+WORD.Reinforce._toggleLLMSection = function () {
+  var body = document.getElementById('llmSectionBody');
+  var icon = document.getElementById('llmSectionIcon');
+  if (!body || !icon) return;
+  WORD.Reinforce._llmSectionCollapsed = !WORD.Reinforce._llmSectionCollapsed;
+  if (WORD.Reinforce._llmSectionCollapsed) {
+    body.style.display = 'none';
+    icon.style.transform = 'rotate(-90deg)';
+  } else {
+    body.style.display = '';
+    icon.style.transform = 'rotate(0)';
+  }
+};
+
+WORD.Reinforce._setLLMStatus = function (text, color) {
+  var el = document.getElementById('llmExtractStatus');
+  if (!el) return;
+  if (!text) {
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+  el.style.display = 'block';
+  el.style.color = color || 'var(--muted)';
+  el.textContent = text;
+};
+
+WORD.Reinforce._pasteFromClipboard = async function () {
+  var ta = document.getElementById('llmExtractInput');
+  if (!ta) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      var txt = await navigator.clipboard.readText();
+      ta.value = txt;
+      ta.focus();
+      WORD.UI.showToast('已粘贴剪贴板内容', 'success', 1500);
+    } else {
+      ta.focus();
+      WORD.UI.showToast('当前浏览器不支持自动粘贴，请手动 Ctrl+V', 'warning');
+    }
+  } catch (e) {
+    // Clipboard access often requires user gesture / permission; fall back gracefully
+    ta.focus();
+    WORD.UI.showToast('剪贴板权限被拒，请手动 Ctrl+V 粘贴', 'warning');
+  }
+};
+
+/**
+ * Trigger LLM extraction from the sidebar input, show preview modal,
+ * let user confirm before applying to word list.
+ */
+WORD.Reinforce.extractWordsFromLLM = async function () {
+  var ta = document.getElementById('llmExtractInput');
+  var btn = document.getElementById('llmExtractBtn');
+  if (!ta || !btn) return;
+  var text = ta.value.trim();
+  if (!text) {
+    WORD.UI.showToast('请先粘贴要提取的文本', 'warning');
+    return;
+  }
+
+  // Lock UI during call
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 提取中…';
+  WORD.Reinforce._setLLMStatus('正在调用 LLM 提取单词对，请稍候…', 'var(--muted)');
+
+  var result;
+  try {
+    result = await WORD.LLM.extractWordPairs(text);
+  } catch (e) {
+    result = { success: false, message: '调用异常：' + e.message };
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '<i class="fas fa-wand-magic-sparkles"></i> 提取';
+
+  if (!result || !result.success) {
+    WORD.Reinforce._setLLMStatus(result && result.message ? result.message : '提取失败', 'var(--error)');
+    WORD.UI.showToast(result && result.message ? result.message : '提取失败', 'error');
+    return;
+  }
+
+  WORD.Reinforce._setLLMStatus('✓ 提取出 ' + result.pairs.length + ' 个单词对', 'var(--accent)');
+  WORD.Reinforce._showExtractedPreview(result.pairs);
+};
+
+/**
+ * Show a modal preview of the extracted pairs. User can edit / remove entries,
+ * then click "应用到单词列表" to fill them into wordInput and trigger setWordList.
+ */
+WORD.Reinforce._showExtractedPreview = function (pairs) {
+  var pairsJson = JSON.stringify(pairs).replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+
+  var rows = '';
+  for (var i = 0; i < pairs.length; i++) {
+    rows +=
+      '<div class="llm-preview-row" data-idx="' + i + '" style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">' +
+        '<span style="font-size:11px;color:var(--muted);min-width:24px;text-align:right;">' + (i + 1) + '</span>' +
+        '<input type="text" class="input-field" data-field="english" value="' + WORD.Utils.escapeHtml(pairs[i].english) + '" style="flex:1;padding:6px 10px;font-size:13px;">' +
+        '<input type="text" class="input-field" data-field="chinese" value="' + WORD.Utils.escapeHtml(pairs[i].chinese) + '" style="flex:1;padding:6px 10px;font-size:13px;">' +
+        '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();WORD.Reinforce._updatePreviewCount();" style="padding:4px 8px;">' +
+          '<i class="fas fa-xmark" style="font-size:10px;"></i>' +
+        '</button>' +
+      '</div>';
+  }
+
+  var html =
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">' +
+      '<i class="fas fa-robot" style="color:#a78bfa;font-size:20px;"></i>' +
+      '<div>' +
+        '<h3 style="margin:0;font-size:18px;font-weight:700;">LLM 提取结果</h3>' +
+        '<p style="margin:2px 0 0;font-size:12px;color:var(--muted);" id="llmPreviewCount">共 ' + pairs.length + ' 个单词对，可编辑或删除</p>' +
+      '</div>' +
+    '</div>' +
+    '<div id="llmPreviewList" style="max-height:60vh;overflow-y:auto;padding-right:4px;">' + rows + '</div>' +
+    '<div style="display:flex;gap:8px;margin-top:16px;padding-top:16px;border-top:1px solid var(--border);">' +
+      '<button class="btn btn-secondary" onclick="WORD.Reinforce._addBlankPreviewRow()" style="flex:0 0 auto;">' +
+        '<i class="fas fa-plus"></i> 添加' +
+      '</button>' +
+      '<button class="btn btn-gold" onclick="WORD.Reinforce._applyPreviewToWordList(this)" style="flex:1;">' +
+        '<i class="fas fa-arrow-right"></i> 应用到单词列表' +
+      '</button>' +
+    '</div>';
+
+  WORD.UI.showModal(html);
+  WORD.Reinforce._updatePreviewCount();
+};
+
+WORD.Reinforce._updatePreviewCount = function () {
+  var list = document.getElementById('llmPreviewList');
+  var counter = document.getElementById('llmPreviewCount');
+  if (!list || !counter) return;
+  var rows = list.querySelectorAll('.llm-preview-row');
+  counter.textContent = '共 ' + rows.length + ' 个单词对，可编辑或删除';
+};
+
+WORD.Reinforce._addBlankPreviewRow = function () {
+  var list = document.getElementById('llmPreviewList');
+  if (!list) return;
+  var nextIdx = list.querySelectorAll('.llm-preview-row').length;
+  var row = document.createElement('div');
+  row.className = 'llm-preview-row';
+  row.setAttribute('data-idx', nextIdx);
+  row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+  row.innerHTML =
+    '<span style="font-size:11px;color:var(--muted);min-width:24px;text-align:right;">' + (nextIdx + 1) + '</span>' +
+    '<input type="text" class="input-field" data-field="english" placeholder="英文" style="flex:1;padding:6px 10px;font-size:13px;">' +
+    '<input type="text" class="input-field" data-field="chinese" placeholder="中文" style="flex:1;padding:6px 10px;font-size:13px;">' +
+    '<button class="btn btn-danger btn-sm" onclick="this.parentElement.remove();WORD.Reinforce._updatePreviewCount();" style="padding:4px 8px;">' +
+      '<i class="fas fa-xmark" style="font-size:10px;"></i>' +
+    '</button>';
+  list.appendChild(row);
+  WORD.Reinforce._updatePreviewCount();
+};
+
+/**
+ * Read all preview rows, append them to the word input, then call saveAndStart
+ * (the modal already served as the edit/confirm step, so no extra click needed).
+ */
+WORD.Reinforce._applyPreviewToWordList = function (btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 应用中…';
+  }
+
+  var list = document.getElementById('llmPreviewList');
+  var rows = list ? list.querySelectorAll('.llm-preview-row') : [];
+  var lines = [];
+  for (var i = 0; i < rows.length; i++) {
+    var enInput = rows[i].querySelector('input[data-field="english"]');
+    var chInput = rows[i].querySelector('input[data-field="chinese"]');
+    var en = enInput ? enInput.value.trim() : '';
+    var ch = chInput ? chInput.value.trim() : '';
+    if (!en) continue;
+    lines.push(en + (ch ? ' ' + ch : ''));
+  }
+
+  if (!lines.length) {
+    WORD.UI.showToast('没有可应用的单词（所有英文都为空）', 'warning');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-arrow-right"></i> 应用到单词列表';
+    }
+    return;
+  }
+
+  // Close the modal first
+  var overlay = document.querySelector('.modal-overlay');
+  if (overlay) overlay.remove();
+
+  // Fill the word input — APPEND (so user doesn't lose existing entries)
+  var ta = document.getElementById('wordInput');
+  if (ta) {
+    var existing = ta.value.trim();
+    ta.value = existing ? existing + '\n' + lines.join('\n') : lines.join('\n');
+  }
+
+  // Go straight to "save & start" — the modal already served as the edit/confirm step,
+  // and WORD.saveAndStart() handles parsing, sidebar collapse, and starting the section.
+  WORD.saveAndStart();
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Save standard answers  ->  start practice
 // ═══════════════════════════════════════════════════════════════════════════════
 
